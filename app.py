@@ -6,7 +6,8 @@ from datetime import datetime
 app = Flask(__name__)
 
 # Configure MySQL database
-app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://root:YourPassword@localhost:3306/expense_management'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://admin:typeslowly@database-1.cfc6seo846k2.us-east-1.rds.amazonaws.com:3306/expense_management'
+
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db.init_app(app)
 
