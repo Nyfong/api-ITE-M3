@@ -1,12 +1,14 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, abort, session
 from flask_sqlalchemy import SQLAlchemy
 from flasgger import Swagger
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
+from functools import wraps
 
+# Initialize Flask app
 app = Flask(__name__)
 
-# Configure MySQL database
+# Configure MySQL database (hardcoded URI)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://admin:typeslowly@database-1.cfc6seo846k2.us-east-1.rds.amazonaws.com:3306/expense_management'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
@@ -21,10 +23,76 @@ app.config['SWAGGER'] = {
 }
 swagger = Swagger(app)
 
-# Import models (ensure models.py is in the same directory)
-from model import User, Category, Expense
+# Secret key for session management
+app.secret_key = 'your-secret-key'
 
-# User registration
+# Define Models
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(128), nullable=False)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'username': self.username,
+            'email': self.email
+        }
+
+class Category(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(80), unique=True, nullable=False)
+    description = db.Column(db.String(255))
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'name': self.name,
+            'description': self.description
+        }
+
+class Expense(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    category_id = db.Column(db.Integer, db.ForeignKey('category.id'), nullable=False)
+    amount = db.Column(db.Float, nullable=False)
+    expense_type = db.Column(db.String(50), nullable=False)  # Income or Expense
+    description = db.Column(db.String(255))
+    expense_date = db.Column(db.Date, nullable=False)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'category_id': self.category_id,
+            'amount': self.amount,
+            'expense_type': self.expense_type,
+            'description': self.description,
+            'expense_date': self.expense_date.strftime('%Y-%m-%d')
+        }
+
+# Create database tables (run once)
+with app.app_context():
+    db.create_all()
+
+# Helper function to validate date format
+def validate_date(date_str):
+    try:
+        return datetime.strptime(date_str, '%Y-%m-%d').date()
+    except ValueError:
+        abort(400, description="Invalid date format. Use YYYY-MM-DD.")
+
+# Login required decorator
+def login_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if 'user_id' not in session:
+            abort(401, description="You must be logged in to access this resource.")
+        return f(*args, **kwargs)
+    return wrapper
+
+# User Registration
 @app.route('/users', methods=['POST'])
 def register_user():
     """
@@ -57,13 +125,69 @@ def register_user():
         description: User registered successfully.
     """
     data = request.json
+    if not data.get('username') or not data.get('email') or not data.get('password'):
+        abort(400, description="Missing required fields: username, email, or password.")
+
     hashed_password = generate_password_hash(data['password'])
     new_user = User(username=data['username'], email=data['email'], password_hash=hashed_password)
     db.session.add(new_user)
     db.session.commit()
     return jsonify({"message": "User registered successfully"}), 201
 
-# Add category
+# User Login
+@app.route('/login', methods=['POST'])
+def login():
+    """
+    Log in a user.
+    ---
+    tags:
+      - Users
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          id: UserLogin
+          required:
+            - username
+            - password
+          properties:
+            username:
+              type: string
+              description: The user's username.
+            password:
+              type: string
+              description: The user's password.
+    responses:
+      200:
+        description: User logged in successfully.
+      401:
+        description: Invalid username or password.
+    """
+    data = request.json
+    user = User.query.filter_by(username=data.get('username')).first()
+    if user and check_password_hash(user.password_hash, data.get('password')):
+        session['user_id'] = user.id
+        return jsonify({"message": "User logged in successfully"}), 200
+    else:
+        abort(401, description="Invalid username or password.")
+
+# User Logout
+@app.route('/logout', methods=['POST'])
+def logout():
+    """
+    Log out the current user.
+    ---
+    tags:
+      - Users
+    responses:
+      200:
+        description: User logged out successfully.
+    """
+    session.pop('user_id', None)
+    return jsonify({"message": "User logged out successfully"}), 200
+
+# Add Category
 @app.route('/categories', methods=['POST'])
 def add_category():
     """
@@ -91,13 +215,17 @@ def add_category():
         description: Category added successfully.
     """
     data = request.json
+    if not data.get('name'):
+        abort(400, description="Missing required field: name.")
+
     new_category = Category(name=data['name'], description=data.get('description'))
     db.session.add(new_category)
     db.session.commit()
     return jsonify({"message": "Category added successfully"}), 201
 
-# Add expense
+# Add Expense
 @app.route('/expenses', methods=['POST'])
+@login_required
 def add_expense():
     """
     Add a new expense.
@@ -111,15 +239,11 @@ def add_expense():
         schema:
           id: Expense
           required:
-            - user_id
             - category_id
             - amount
             - expense_type
             - expense_date
           properties:
-            user_id:
-              type: integer
-              description: The ID of the user.
             category_id:
               type: integer
               description: The ID of the category.
@@ -143,41 +267,169 @@ def add_expense():
         description: Expense added successfully.
     """
     data = request.json
+    required_fields = ['category_id', 'amount', 'expense_type', 'expense_date']
+    if not all(field in data for field in required_fields):
+        abort(400, description=f"Missing required fields: {required_fields}")
+
+    expense_date = validate_date(data['expense_date'])
     new_expense = Expense(
-        user_id=data['user_id'],
+        user_id=session['user_id'],  # Use the logged-in user's ID
         category_id=data['category_id'],
         amount=data['amount'],
         expense_type=data['expense_type'],
         description=data.get('description'),
-        expense_date=datetime.strptime(data['expense_date'], '%Y-%m-%d').date()
+        expense_date=expense_date
     )
     db.session.add(new_expense)
     db.session.commit()
     return jsonify({"message": "Expense added successfully"}), 201
 
-# Get all expenses
-@app.route('/expenses', methods=['GET'])
-def get_expenses():
+# Edit Expense
+@app.route('/expenses/<int:expense_id>', methods=['PUT'])
+@login_required
+def edit_expense(expense_id):
     """
-    Get all expenses.
+    Edit an existing expense.
     ---
     tags:
       - Expenses
+    parameters:
+      - in: path
+        name: expense_id
+        required: true
+        type: integer
+        description: The ID of the expense to edit.
+      - in: body
+        name: body
+        required: true
+        schema:
+          id: Expense
+          properties:
+            amount:
+              type: number
+              format: float
+              description: The updated amount of the expense.
+            expense_type:
+              type: string
+              enum: [Income, Expense]
+              description: The updated type of the expense (Income or Expense).
+            description:
+              type: string
+              description: The updated description of the expense.
+            expense_date:
+              type: string
+              format: date
+              description: The updated date of the expense (YYYY-MM-DD).
     responses:
       200:
-        description: A list of expenses.
-        schema:
-          type: array
-          items:
-            $ref: '#/definitions/Expense'
+        description: Expense updated successfully.
     """
-    expenses = Expense.query.all()
+    data = request.json
+    expense = Expense.query.get_or_404(expense_id)
+
+    # Ensure the expense belongs to the logged-in user
+    if expense.user_id != session['user_id']:
+        abort(403, description="You are not authorized to edit this expense.")
+
+    if 'amount' in data:
+        expense.amount = data['amount']
+    if 'expense_type' in data:
+        expense.expense_type = data['expense_type']
+    if 'description' in data:
+        expense.description = data['description']
+    if 'expense_date' in data:
+        expense.expense_date = validate_date(data['expense_date'])
+
+    db.session.commit()
+    return jsonify({"message": "Expense updated successfully"}), 200
+
+# Delete Expense
+@app.route('/expenses/<int:expense_id>', methods=['DELETE'])
+@login_required
+def delete_expense(expense_id):
+    """
+    Delete an expense.
+    ---
+    tags:
+      - Expenses
+    parameters:
+      - in: path
+        name: expense_id
+        required: true
+        type: integer
+        description: The ID of the expense to delete.
+    responses:
+      200:
+        description: Expense deleted successfully.
+    """
+    expense = Expense.query.get_or_404(expense_id)
+
+    # Ensure the expense belongs to the logged-in user
+    if expense.user_id != session['user_id']:
+        abort(403, description="You are not authorized to delete this expense.")
+
+    db.session.delete(expense)
+    db.session.commit()
+    return jsonify({"message": "Expense deleted successfully"}), 200
+
+# Search Expenses by Date Range
+@app.route('/expenses/date-range', methods=['GET'])
+@login_required
+def search_expenses_by_date_range():
+    """
+    Search for expenses by date range.
+    ---
+    tags:
+      - Expenses
+    parameters:
+      - in: query
+        name: start_date
+        type: string
+        format: date
+        description: The start date for filtering expenses (YYYY-MM-DD).
+      - in: query
+        name: end_date
+        type: string
+        format: date
+        description: The end date for filtering expenses (YYYY-MM-DD).
+    responses:
+      200:
+        description: A list of expenses within the specified date range.
+    """
+    start_date = request.args.get('start_date')
+    end_date = request.args.get('end_date')
+
+    query = Expense.query.filter_by(user_id=session['user_id'])
+
+    if start_date:
+        query = query.filter(Expense.expense_date >= validate_date(start_date))
+    if end_date:
+        query = query.filter(Expense.expense_date <= validate_date(end_date))
+
+    expenses = query.all()
     return jsonify([expense.to_dict() for expense in expenses]), 200
 
-# Swagger definition for Expense
-@app.route('/swagger')
-def swagger_spec():
-    return jsonify(swagger.get_apispecs())
+# Search Expenses by Category
+@app.route('/expenses/category/<int:category_id>', methods=['GET'])
+@login_required
+def search_expenses_by_category(category_id):
+    """
+    Search for expenses by category.
+    ---
+    tags:
+      - Expenses
+    parameters:
+      - in: path
+        name: category_id
+        required: true
+        type: integer
+        description: The ID of the category.
+    responses:
+      200:
+        description: A list of expenses for the specified category.
+    """
+    expenses = Expense.query.filter_by(user_id=session['user_id'], category_id=category_id).all()
+    return jsonify([expense.to_dict() for expense in expenses]), 200
 
 # Run the Flask app
 if __name__ == '__main__':
