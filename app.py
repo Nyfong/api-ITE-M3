@@ -251,6 +251,21 @@ def add_category():
         db.session.rollback()
         return jsonify({"error": "Database connection error. Please try again."}), 500
 
+# Get all categories
+@app.route('/categories', methods=['GET'])
+def get_all_categories():
+    """
+    Get all categories.
+    ---
+    tags:
+      - Categories
+    responses:
+      200:
+        description: A list of all categories.
+    """
+    categories = Category.query.all()
+    return jsonify([category.to_dict() for category in categories]), 200
+
 # Add Expense
 @app.route('/expenses', methods=['POST'])
 @login_required
