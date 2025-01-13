@@ -4,13 +4,20 @@ from flasgger import Swagger
 from werkzeug.security import generate_password_hash, check_password_hash
 from datetime import datetime
 from functools import wraps
+from sqlalchemy.exc import OperationalError
 
 # Initialize Flask app
 app = Flask(__name__)
 
-# Configure MySQL database (hardcoded URI)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://admin:typeslowly@database-1.cfc6seo846k2.us-east-1.rds.amazonaws.com:3306/expense_management'
+# Configure MySQL database
+app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://admin:typeslowly@database-1.cfc6seo846k2.us-east-1.rds.amazonaws.com:3306/expense_management?charset=utf8mb4'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    'pool_size': 10,
+    'pool_recycle': 3600,  # Recycle connections after 1 hour
+    'pool_timeout': 30,    # Timeout for acquiring a connection from the pool
+    'max_overflow': 20,    # Maximum number of connections to create beyond the pool_size
+}
 
 # Initialize SQLAlchemy
 db = SQLAlchemy(app)
@@ -25,41 +32,51 @@ swagger = Swagger(app)
 
 # Secret key for session management
 app.secret_key = 'your-secret-key'
+app.config['SESSION_COOKIE_SECURE'] = True
+app.config['SESSION_COOKIE_HTTPONLY'] = True
 
 # Define Models
 class User(db.Model):
+    __tablename__ = 'users'
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
     email = db.Column(db.String(120), unique=True, nullable=False)
     password_hash = db.Column(db.String(128), nullable=False)
+    created_at = db.Column(db.DateTime, server_default=db.func.now())
 
     def to_dict(self):
         return {
             'id': self.id,
             'username': self.username,
-            'email': self.email
+            'email': self.email,
+            'created_at': str(self.created_at)
         }
 
 class Category(db.Model):
+    __tablename__ = 'categories'
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(80), unique=True, nullable=False)
-    description = db.Column(db.String(255))
+    description = db.Column(db.String(255), nullable=True)
+    created_at = db.Column(db.DateTime, server_default=db.func.now())
 
     def to_dict(self):
         return {
             'id': self.id,
             'name': self.name,
-            'description': self.description
+            'description': self.description,
+            'created_at': str(self.created_at)
         }
 
 class Expense(db.Model):
+    __tablename__ = 'expenses'
     id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    category_id = db.Column(db.Integer, db.ForeignKey('category.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    category_id = db.Column(db.Integer, db.ForeignKey('categories.id'), nullable=False)
     amount = db.Column(db.Float, nullable=False)
-    expense_type = db.Column(db.String(50), nullable=False)  # Income or Expense
-    description = db.Column(db.String(255))
+    expense_type = db.Column(db.Enum('Income', 'Expense'), nullable=False)
+    description = db.Column(db.String(255), nullable=True)
     expense_date = db.Column(db.Date, nullable=False)
+    created_at = db.Column(db.DateTime, server_default=db.func.now())
 
     def to_dict(self):
         return {
@@ -69,7 +86,8 @@ class Expense(db.Model):
             'amount': self.amount,
             'expense_type': self.expense_type,
             'description': self.description,
-            'expense_date': self.expense_date.strftime('%Y-%m-%d')
+            'expense_date': str(self.expense_date),
+            'created_at': str(self.created_at)
         }
 
 # Create database tables (run once)
@@ -130,9 +148,14 @@ def register_user():
 
     hashed_password = generate_password_hash(data['password'])
     new_user = User(username=data['username'], email=data['email'], password_hash=hashed_password)
-    db.session.add(new_user)
-    db.session.commit()
-    return jsonify({"message": "User registered successfully"}), 201
+    
+    try:
+        db.session.add(new_user)
+        db.session.commit()
+        return jsonify({"message": "User registered successfully"}), 201
+    except OperationalError as e:
+        db.session.rollback()
+        return jsonify({"error": "Database connection error. Please try again."}), 500
 
 # User Login
 @app.route('/login', methods=['POST'])
@@ -219,9 +242,14 @@ def add_category():
         abort(400, description="Missing required field: name.")
 
     new_category = Category(name=data['name'], description=data.get('description'))
-    db.session.add(new_category)
-    db.session.commit()
-    return jsonify({"message": "Category added successfully"}), 201
+    
+    try:
+        db.session.add(new_category)
+        db.session.commit()
+        return jsonify({"message": "Category added successfully"}), 201
+    except OperationalError as e:
+        db.session.rollback()
+        return jsonify({"error": "Database connection error. Please try again."}), 500
 
 # Add Expense
 @app.route('/expenses', methods=['POST'])
@@ -280,9 +308,30 @@ def add_expense():
         description=data.get('description'),
         expense_date=expense_date
     )
-    db.session.add(new_expense)
-    db.session.commit()
-    return jsonify({"message": "Expense added successfully"}), 201
+    
+    try:
+        db.session.add(new_expense)
+        db.session.commit()
+        return jsonify({"message": "Expense added successfully"}), 201
+    except OperationalError as e:
+        db.session.rollback()
+        return jsonify({"error": "Database connection error. Please try again."}), 500
+
+# Get all expenses for the logged-in user
+@app.route('/expenses', methods=['GET'])
+@login_required
+def get_all_expenses():
+    """
+    Get all expenses for the logged-in user.
+    ---
+    tags:
+      - Expenses
+    responses:
+      200:
+        description: A list of all expenses for the logged-in user.
+    """
+    expenses = Expense.query.filter_by(user_id=session['user_id']).all()
+    return jsonify([expense.to_dict() for expense in expenses]), 200
 
 # Edit Expense
 @app.route('/expenses/<int:expense_id>', methods=['PUT'])
@@ -340,8 +389,12 @@ def edit_expense(expense_id):
     if 'expense_date' in data:
         expense.expense_date = validate_date(data['expense_date'])
 
-    db.session.commit()
-    return jsonify({"message": "Expense updated successfully"}), 200
+    try:
+        db.session.commit()
+        return jsonify({"message": "Expense updated successfully"}), 200
+    except OperationalError as e:
+        db.session.rollback()
+        return jsonify({"error": "Database connection error. Please try again."}), 500
 
 # Delete Expense
 @app.route('/expenses/<int:expense_id>', methods=['DELETE'])
@@ -368,9 +421,13 @@ def delete_expense(expense_id):
     if expense.user_id != session['user_id']:
         abort(403, description="You are not authorized to delete this expense.")
 
-    db.session.delete(expense)
-    db.session.commit()
-    return jsonify({"message": "Expense deleted successfully"}), 200
+    try:
+        db.session.delete(expense)
+        db.session.commit()
+        return jsonify({"message": "Expense deleted successfully"}), 200
+    except OperationalError as e:
+        db.session.rollback()
+        return jsonify({"error": "Database connection error. Please try again."}), 500
 
 # Search Expenses by Date Range
 @app.route('/expenses/date-range', methods=['GET'])
